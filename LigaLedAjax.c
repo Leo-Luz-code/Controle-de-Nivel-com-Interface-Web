@@ -24,18 +24,18 @@
 #define VOLT_MIN 2.6f  // Corresponde a 100%
 #define VOLT_MAX 3.13f // Corresponde a 0%
 
-#define WIFI_SSID "Seu SSID"
-#define WIFI_PASS "Sua Senha"
+#define WIFI_SSID "PMVC/SEMGI 1"
+#define WIFI_PASS "12cf953e17"
 
 #define I2C_PORT_DISP i2c1
 #define I2C_SDA_DISP 14
 #define I2C_SCL_DISP 15
 #define endereco 0x3C
 
-float nivel_minimo;        // Nível mínimo de água
-float nivel_maximo;        // Nível máximo de água
-float nivel_atual;         // Nível atual de água
-bool estado_bomba = false; // Estado da bomba (ligada/desligada)
+float nivel_minimo = 20.0f; // Nível mínimo de água
+float nivel_maximo = 80.0f; // Nível máximo de água
+float nivel_atual;          // Nível atual de água
+bool estado_bomba = false;  // Estado da bomba (ligada/desligada)
 
 const char HTML_BODY[] =
     "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Controle de Nível</title>"
@@ -61,16 +61,8 @@ const char HTML_BODY[] =
     "function atualizarNiveis() {"
     "  const min = document.getElementById('nivel_minimo').value;"
     "  const max = document.getElementById('nivel_maximo').value;"
-    "  if (min < 0 || min > 100 || max < 0 || max > 100) { "
-    "    alert(\"Os níveis devem estar entre 0 e 100.\");"
-    "    return;"
-    "  }"
     "  if (parseInt(min) >= parseInt(max)) {"
     "    alert(\"O nível mínimo deve ser menor que o nível máximo.\");"
-    "    return;"
-    "  }"
-    "  if (isNaN(min) || isNaN(max)) {"
-    "    alert(\"Por favor, insira valores numéricos válidos.\");"
     "    return;"
     "  }"
     "     fetch('/set_niveis?min=' + min + '&max=' + max) "
@@ -118,7 +110,7 @@ const char HTML_BODY[] =
 
 struct http_state
 {
-    char response[4096];
+    char response[8192];
     size_t len;
     size_t sent;
 };
@@ -354,9 +346,13 @@ int main()
     gpio_set_dir(BOTAO_JOY, GPIO_IN);
     gpio_pull_up(BOTAO_JOY);
 
+    // gpio_init(RELAY_PIN);
+    // gpio_set_dir(RELAY_PIN, GPIO_OUT);
+    // gpio_put(RELAY_PIN, 0);
+
     adc_init();
-    adc_gpio_init(JOYSTICK_X);
-    adc_gpio_init(JOYSTICK_Y);
+    adc_gpio_init(POT_PIN);
+    adc_select_input(2);
 
     i2c_init(I2C_PORT_DISP, 400 * 1000);
     gpio_set_function(I2C_SDA_DISP, GPIO_FUNC_I2C);
@@ -399,40 +395,69 @@ int main()
     ssd1306_send_data(&ssd);
 
     start_http_server();
-    char str_x[5]; // Buffer para armazenar a string
-    char str_y[5]; // Buffer para armazenar a string
-    bool cor = true;
+    // char str_x[5]; // Buffer para armazenar a string
+    // char str_y[5]; // Buffer para armazenar a string
+    // bool cor = true;
+
+    char buffer[20];
     while (true)
     {
         cyw43_arch_poll();
 
-        // Leitura dos valores analógicos
-        adc_select_input(0);
-        uint16_t adc_value_x = adc_read();
-        adc_select_input(1);
-        uint16_t adc_value_y = adc_read();
+        uint16_t adc_raw = read_adc_avg();
+        float voltage = read_voltage(adc_raw);
+        float level = calculate_level(voltage);
 
-        sprintf(str_x, "%d", adc_value_x);            // Converte o inteiro em string
-        sprintf(str_y, "%d", adc_value_y);            // Converte o inteiro em string
-        ssd1306_fill(&ssd, !cor);                     // Limpa o display
-        ssd1306_rect(&ssd, 3, 3, 122, 60, cor, !cor); // Desenha um retângulo
-        ssd1306_line(&ssd, 3, 25, 123, 25, cor);      // Desenha uma linha
-        ssd1306_line(&ssd, 3, 37, 123, 37, cor);      // Desenha uma linha
+        ssd1306_fill(&ssd, false);
 
-        ssd1306_draw_string(&ssd, "CEPEDI   TIC37", 8, 6); // Desenha uma string
-        ssd1306_draw_string(&ssd, "EMBARCATECH", 20, 16);  // Desenha uma string
-        ssd1306_draw_string(&ssd, ip_str, 10, 28);
-        ssd1306_draw_string(&ssd, "X    Y    PB", 20, 41);           // Desenha uma string
-        ssd1306_line(&ssd, 44, 37, 44, 60, cor);                     // Desenha uma linha vertical
-        ssd1306_draw_string(&ssd, str_x, 8, 52);                     // Desenha uma string
-        ssd1306_line(&ssd, 84, 37, 84, 60, cor);                     // Desenha uma linha vertical
-        ssd1306_draw_string(&ssd, str_y, 49, 52);                    // Desenha uma string
-        ssd1306_rect(&ssd, 52, 90, 8, 8, cor, !gpio_get(BOTAO_JOY)); // Desenha um retângulo
-        ssd1306_rect(&ssd, 52, 102, 8, 8, cor, !gpio_get(BOTAO_A));  // Desenha um retângulo
-        ssd1306_rect(&ssd, 52, 114, 8, 8, cor, !cor);                // Desenha um retângulo
-        ssd1306_send_data(&ssd);                                     // Atualiza o display
+        snprintf(buffer, sizeof(buffer), "ADC: %d", adc_raw);
+        ssd1306_draw_string(&ssd, buffer, 10, 5);
 
-        sleep_ms(300);
+        snprintf(buffer, sizeof(buffer), "V: %.2f", voltage);
+        ssd1306_draw_string(&ssd, buffer, 10, 15);
+
+        snprintf(buffer, sizeof(buffer), "%%: %.2f", level);
+        ssd1306_draw_string(&ssd, buffer, 10, 25);
+
+        snprintf(buffer, sizeof(buffer), "MAX: %.2f", nivel_maximo);
+        ssd1306_draw_string(&ssd, buffer, 10, 35);
+
+        snprintf(buffer, sizeof(buffer), "MIN: %.2f", nivel_minimo);
+        ssd1306_draw_string(&ssd, buffer, 10, 45);
+
+        ssd1306_draw_string(&ssd, ip_str, 10, 55);
+
+        ssd1306_send_data(&ssd);
+
+        sleep_ms(100);
+
+        // // Leitura dos valores analógicos
+        // adc_select_input(0);
+        // uint16_t adc_value_x = adc_read();
+        // adc_select_input(1);
+        // uint16_t adc_value_y = adc_read();
+
+        // sprintf(str_x, "%d", adc_value_x);            // Converte o inteiro em string
+        // sprintf(str_y, "%d", adc_value_y);            // Converte o inteiro em string
+        // ssd1306_fill(&ssd, !cor);                     // Limpa o display
+        // ssd1306_rect(&ssd, 3, 3, 122, 60, cor, !cor); // Desenha um retângulo
+        // ssd1306_line(&ssd, 3, 25, 123, 25, cor);      // Desenha uma linha
+        // ssd1306_line(&ssd, 3, 37, 123, 37, cor);      // Desenha uma linha
+
+        // ssd1306_draw_string(&ssd, "CEPEDI   TIC37", 8, 6); // Desenha uma string
+        // ssd1306_draw_string(&ssd, "EMBARCATECH", 20, 16);  // Desenha uma string
+        // ssd1306_draw_string(&ssd, ip_str, 10, 28);
+        // ssd1306_draw_string(&ssd, "X    Y    PB", 20, 41);           // Desenha uma string
+        // ssd1306_line(&ssd, 44, 37, 44, 60, cor);                     // Desenha uma linha vertical
+        // ssd1306_draw_string(&ssd, str_x, 8, 52);                     // Desenha uma string
+        // ssd1306_line(&ssd, 84, 37, 84, 60, cor);                     // Desenha uma linha vertical
+        // ssd1306_draw_string(&ssd, str_y, 49, 52);                    // Desenha uma string
+        // ssd1306_rect(&ssd, 52, 90, 8, 8, cor, !gpio_get(BOTAO_JOY)); // Desenha um retângulo
+        // ssd1306_rect(&ssd, 52, 102, 8, 8, cor, !gpio_get(BOTAO_A));  // Desenha um retângulo
+        // ssd1306_rect(&ssd, 52, 114, 8, 8, cor, !cor);                // Desenha um retângulo
+        // ssd1306_send_data(&ssd);                                     // Atualiza o display
+
+        // sleep_ms(300);
     }
 
     cyw43_arch_deinit();

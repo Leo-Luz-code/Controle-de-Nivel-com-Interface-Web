@@ -94,16 +94,6 @@
           return;
         }
 
-        if (parseInt(min) >= parseInt(max)) {
-          alert("O nível mínimo deve ser menor que o nível máximo.");
-          return;
-        }
-
-        if (isNaN(min) || isNaN(max)) {
-          alert("Por favor, insira valores numéricos válidos.");
-          return;
-        }
-
         fetch("/set_niveis?min=" + min + "&max=" + max)
           .then((response) => response.text())
           .then((data) => console.log(data));
