@@ -24,8 +24,10 @@
 #define VOLT_MIN 2.6f  // Corresponde a 100%
 #define VOLT_MAX 3.13f // Corresponde a 0%
 
-#define WIFI_SSID "PMVC/SEMGI 1"
-#define WIFI_PASS "12cf953e17"
+#define HISTERESE 2.0f // Margem de 2% para evitar oscilação
+
+#define WIFI_SSID "Familia Luz"
+#define WIFI_PASS "65327890"
 
 #define I2C_PORT_DISP i2c1
 #define I2C_SDA_DISP 14
@@ -59,8 +61,8 @@ const char HTML_BODY[] =
     "</style>"
     "<script>"
     "function atualizarNiveis() {"
-    "  const min = document.getElementById('nivel_minimo').value;"
-    "  const max = document.getElementById('nivel_maximo').value;"
+    "  const min = document.getElementById('nivel_minimo_input').value;"
+    "  const max = document.getElementById('nivel_maximo_input').value;"
     "  if (parseInt(min) >= parseInt(max)) {"
     "    alert(\"O nível mínimo deve ser menor que o nível máximo.\");"
     "    return;"
@@ -73,8 +75,8 @@ const char HTML_BODY[] =
     "  fetch('/estado').then(res => res.json()).then(data => {"
     "    document.getElementById('barra_nivel_agua').style.width = data.nivel + '%';"
     "    document.getElementById('nivel_atual').innerText = data.nivel + '%';"
-    "    document.getElementById('nivel_minimo').value = data.min;"
-    "    document.getElementById('nivel_maximo').value = data.max;"
+    "    document.getElementById('nivel_minimo_text').innerText = data.min + '%';"
+    "    document.getElementById('nivel_maximo_text').innerText = data.max + '%';"
     "    const statusBomba = document.getElementById('status_bomba');"
     "    statusBomba.innerText = data.bomba ? 'LIGADA' : 'DESLIGADA';"
     "    statusBomba.className = data.bomba ? 'status bomba-ligada' : 'status bomba-desligada';"
@@ -92,13 +94,15 @@ const char HTML_BODY[] =
 
     "<div class='config-container'>"
     "<div class='config-input'>"
-    "<label for='nivel_minimo'>Nível Mínimo (0-100):</label>"
-    "<input type='number' id='nivel_minimo' min='0' max='100' value='20'>"
+    "<div class='nivel-texto'>Nível Mínimo: <span id='nivel_minimo_text'>--</span></div>"
+    "<label for='nivel_minimo_input'>Nível Mínimo (0-100):</label>"
+    "<input type='number' id='nivel_minimo_input' min='0' max='100' value='20'>"
     "</div>"
 
     "<div class='config-input'>"
-    "<label for='nivel_maximo'>Nível Máximo (0-100):</label>"
-    "<input type='number' id='nivel_maximo' min='0' max='100' value='80'>"
+    "<div class='nivel-texto'>Nível Máximo: <span id='nivel_maximo_text'>--</span></div>"
+    "<label for='nivel_maximo_input'>Nível Máximo (0-100):</label>"
+    "<input type='number' id='nivel_maximo_input' min='0' max='100' value='80'>"
     "</div>"
     "</div>"
 
@@ -207,23 +211,20 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
 
         nivel_atual = level;
 
-        estado_bomba = gpio_get(RELAY_PIN) == 1;
-
-        if (nivel_atual < nivel_minimo)
+        // Verifica se deve LIGAR a bomba (nível abaixo do mínimo - histerese)
+        if (nivel_atual <= (nivel_minimo - HISTERESE) && !estado_bomba)
         {
-            if (!estado_bomba)
-            {
-                gpio_put(RELAY_PIN, 1); // Liga a bomba
-                estado_bomba = true;
-            }
+            gpio_put(RELAY_PIN, 1);
+            estado_bomba = true;
+            printf("Bomba LIGADA - Nível: %.2f (abaixo de %.2f)\n", nivel_atual, nivel_minimo);
         }
-        else if (nivel_atual > nivel_maximo)
+
+        // Verifica se deve DESLIGAR a bomba (nível acima do máximo + histerese)
+        if (nivel_atual >= (nivel_maximo + HISTERESE) && estado_bomba)
         {
-            if (estado_bomba)
-            {
-                gpio_put(RELAY_PIN, 0); // Desliga a bomba
-                estado_bomba = false;
-            }
+            gpio_put(RELAY_PIN, 0);
+            estado_bomba = false;
+            printf("Bomba DESLIGADA - Nível: %.2f (acima de %.2f)\n", nivel_atual, nivel_maximo);
         }
 
         // adc_select_input(0);
@@ -240,8 +241,8 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
 
         char json_payload[128];
         int json_len = snprintf(json_payload, sizeof(json_payload),
-                                "{\"nivel\":%d,\"bomba\":%d,\"min\":%d,\"max\":%d}",
-                                nivel_atual, gpio_get(RELAY_PIN), nivel_minimo, nivel_maximo);
+                                "{\"nivel\":%.2f,\"bomba\":%d,\"min\":%.2f,\"max\":%.2f}",
+                                nivel_atual, estado_bomba, nivel_minimo, nivel_maximo);
 
         printf("[DEBUG] JSON: %s\n", json_payload);
 
@@ -257,7 +258,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
     else if (strstr(req, "GET /set_niveis"))
     {
         float min, max;
-        sscanf(req, "GET /set_niveis?min=%d&max=%d", &min, &max);
+        sscanf(req, "GET /set_niveis?min=%f&max=%f", &min, &max);
         nivel_minimo = min;
         nivel_maximo = max;
 
