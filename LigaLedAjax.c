@@ -4,41 +4,66 @@
 #include "hardware/i2c.h"
 #include "hardware/adc.h"
 #include "hardware/gpio.h"
+#include "hardware/pwm.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "ssd1306.h"
 #include "font.h"
 
-#define LED_PIN 12
+#include "pico/bootrom.h"
+
+// Definições de pinos para botões e LEDs
+#define BOTAO_B 6
+#define LED_AMARELO 4
+#define LED_VERDE 9
+#define LED_VERMELHO 8
 #define BOTAO_A 5
 #define BOTAO_JOY 22
-#define JOYSTICK_X 26
-#define JOYSTICK_Y 27
 #define POT_PIN 28
 #define RELAY_PIN 16
-#define ADC_INPUT 2     // ADC2 (GPIO28)
-#define VREF 3.3f       // Tensão de referência
-#define ADC_MAX 4095.0f // ADC de 12 bits
+#define ADC_INPUT 2     // ADC2 (GPIO28) para leitura do sensor de nível
+#define VREF 3.3f       // Tensão de referência do ADC (3.3V)
+#define ADC_MAX 4095.0f // Resolução do ADC de 12 bits
 
-#define VOLT_MIN 2.6f  // Corresponde a 100%
-#define VOLT_MAX 3.13f // Corresponde a 0%
+// Configurações do buzzer
+const uint BUZZER_A = 21;                      // Pino do buzzer
+volatile bool botao_pressionado = false;        // Estado do botão pressionado
+uint64_t this_current_time;                    // Tempo atual em microssegundos
+uint32_t last_buzzer_time = 0;                 // Último momento que o buzzer foi acionado
+uint32_t buzzer_interval = 250000;             // Intervalo para desligar o buzzer (em microssegundos)
+bool buzzer_state = false;                     // Estado atual do buzzer (ligado/desligado)
+const float DIVIDER_PWM = 16.0;                // Divisor de clock para PWM do buzzer
+const uint16_t PERIOD = 4096;                  // Período do PWM para o buzzer
+uint slice_buzzer;                             // Slice PWM associado ao buzzer
 
-#define HISTERESE 2.0f // Margem de 2% para evitar oscilação
+// Limites de tensão para cálculo do nível de água
+#define VOLT_MIN 2.6f  // Tensão correspondente a 100% do nível
+#define VOLT_MAX 3.13f // Tensão correspondente a 0% do nível
+#define HISTERESE 2.0f // Margem de 2% para evitar oscilações na lógica de controle
 
-#define WIFI_SSID "Familia Luz"
-#define WIFI_PASS "65327890"
+// Configurações de Wi-Fi
+#define WIFI_SSID "Jonas Souza"
+#define WIFI_PASS "12345678"
 
+// Configurações do display OLED I2C
 #define I2C_PORT_DISP i2c1
 #define I2C_SDA_DISP 14
 #define I2C_SCL_DISP 15
-#define endereco 0x3C
+#define endereco 0x3C  // Endereço I2C do display SSD1306
 
-float nivel_minimo = 20.0f; // Nível mínimo de água
-float nivel_maximo = 80.0f; // Nível máximo de água
-float nivel_atual;          // Nível atual de água
+// Variáveis para controle do nível de água
+float nivel_minimo = 20.0f; // Nível mínimo de água (%)
+float nivel_maximo = 80.0f; // Nível máximo de água (%)
+float nivel_atual;          // Nível atual de água (%)
 bool estado_bomba = false;  // Estado da bomba (ligada/desligada)
 
+// Variáveis para debounce de botões
+uint32_t current_time;       // Tempo atual para verificação de debounce
+static volatile uint32_t last_time_A = 0; // Último tempo de pressionamento do botão A
+static volatile uint32_t last_time_B = 0; // Último tempo de pressionamento do botão B
+
+// Página HTML para interface web
 const char HTML_BODY[] =
     "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Controle de Nível</title>"
     "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
@@ -112,18 +137,74 @@ const char HTML_BODY[] =
     "</div>"
     "</body></html>";
 
+// Estrutura para gerenciar respostas HTTP
 struct http_state
 {
-    char response[8192];
-    size_t len;
-    size_t sent;
+    char response[8192]; // Buffer para resposta HTTP
+    size_t len;          // Tamanho da resposta
+    size_t sent;         // Quantidade de dados enviados
 };
 
+// Manipulador de interrupção para botões
+void gpio_irq_handler(uint gpio, uint32_t event)
+{
+    current_time = to_us_since_boot(get_absolute_time());
+
+    // Botão A: Reseta níveis mínimo e máximo
+    if (gpio == BOTAO_A && (current_time - last_time_A > 200000))
+    {
+        last_time_A = current_time;
+        nivel_maximo = 80.0f;
+        nivel_minimo = 20.0f;
+    }
+
+    // Botão B: Entra no modo bootloader
+    if (gpio == BOTAO_B)
+    {
+        reset_usb_boot(0, 0);
+    }
+}
+
+// Funções para controle dos LEDs
+void ligar_led_amarelo() {
+    gpio_put(LED_AMARELO, 1);
+    gpio_put(LED_VERDE, 0);
+    gpio_put(LED_VERMELHO, 0);
+}
+
+void ligar_led_verde() {
+    gpio_put(LED_VERDE, 1);
+    gpio_put(LED_AMARELO, 0);
+    gpio_put(LED_VERMELHO, 0);
+}
+
+void ligar_led_vermelho() {
+    gpio_put(LED_VERDE, 0);
+    gpio_put(LED_AMARELO, 0);
+    gpio_put(LED_VERMELHO, 1);
+}
+
+// Funções para controle do buzzer
+void buzzer_on()
+{
+    pwm_set_gpio_level(BUZZER_A, 300); // Define nível PWM para ligar o buzzer
+    buzzer_state = true;
+    last_buzzer_time = time_us_64();
+}
+
+void buzzer_off()
+{
+    pwm_set_gpio_level(BUZZER_A, 0); // Desliga o buzzer
+    buzzer_state = false;
+}
+
+// Converte leitura do ADC em tensão
 float read_voltage(uint16_t adc_val)
 {
     return (adc_val * VREF) / ADC_MAX;
 }
 
+// Calcula média de 16 leituras do ADC para maior precisão
 uint16_t read_adc_avg()
 {
     uint32_t sum = 0;
@@ -135,30 +216,31 @@ uint16_t read_adc_avg()
     return sum / 16;
 }
 
+// Calcula o nível de água com base na tensão
 float calculate_level(float voltage)
 {
     float level = ((VOLT_MAX - voltage) / (VOLT_MAX - VOLT_MIN)) * 100.0f;
-
     if (level < 0.0f)
         level = 0.0f;
     else if (level > 100.0f)
         level = 100.0f;
-
     return level;
 }
 
+// Callback para envio de dados HTTP
 static err_t http_sent(void *arg, struct tcp_pcb *tpcb, u16_t len)
 {
     struct http_state *hs = (struct http_state *)arg;
     hs->sent += len;
     if (hs->sent >= hs->len)
     {
-        tcp_close(tpcb);
+        tcp_close(tpcb); // Fecha conexão após envio completo
         free(hs);
     }
     return ERR_OK;
 }
 
+// Manipula requisições HTTP recebidas
 static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
     if (!p)
@@ -177,68 +259,9 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
     }
     hs->sent = 0;
 
-    if (strstr(req, "GET /led/on"))
+    // Responde com estado atual do sistema em JSON
+    if (strstr(req, "GET /estado"))
     {
-        gpio_put(LED_PIN, 1);
-        const char *txt = "Ligado";
-        hs->len = snprintf(hs->response, sizeof(hs->response),
-                           "HTTP/1.1 200 OK\r\n"
-                           "Content-Type: text/plain\r\n"
-                           "Content-Length: %d\r\n"
-                           "Connection: close\r\n"
-                           "\r\n"
-                           "%s",
-                           (int)strlen(txt), txt);
-    }
-    else if (strstr(req, "GET /led/off"))
-    {
-        gpio_put(LED_PIN, 0);
-        const char *txt = "Desligado";
-        hs->len = snprintf(hs->response, sizeof(hs->response),
-                           "HTTP/1.1 200 OK\r\n"
-                           "Content-Type: text/plain\r\n"
-                           "Content-Length: %d\r\n"
-                           "Connection: close\r\n"
-                           "\r\n"
-                           "%s",
-                           (int)strlen(txt), txt);
-    }
-    else if (strstr(req, "GET /estado"))
-    {
-        uint16_t adc_raw = read_adc_avg();
-        float voltage = read_voltage(adc_raw);
-        float level = calculate_level(voltage);
-
-        nivel_atual = level;
-
-        // Verifica se deve LIGAR a bomba (nível abaixo do mínimo - histerese)
-        if (nivel_atual <= (nivel_minimo - HISTERESE) && !estado_bomba)
-        {
-            gpio_put(RELAY_PIN, 1);
-            estado_bomba = true;
-            printf("Bomba LIGADA - Nível: %.2f (abaixo de %.2f)\n", nivel_atual, nivel_minimo);
-        }
-
-        // Verifica se deve DESLIGAR a bomba (nível acima do máximo + histerese)
-        if (nivel_atual >= (nivel_maximo + HISTERESE) && estado_bomba)
-        {
-            gpio_put(RELAY_PIN, 0);
-            estado_bomba = false;
-            printf("Bomba DESLIGADA - Nível: %.2f (acima de %.2f)\n", nivel_atual, nivel_maximo);
-        }
-
-        // adc_select_input(0);
-        // uint16_t x = adc_read();
-        // adc_select_input(1);
-        // uint16_t y = adc_read();
-        // int botao = !gpio_get(BOTAO_A);
-        // int joy = !gpio_get(BOTAO_JOY);
-
-        // char json_payload[96];
-        // int json_len = snprintf(json_payload, sizeof(json_payload),
-        //                         "{\"led\":%d,\"x\":%d,\"y\":%d,\"botao\":%d,\"joy\":%d}\r\n",
-        //                         gpio_get(LED_PIN), x, y, botao, joy);
-
         char json_payload[128];
         int json_len = snprintf(json_payload, sizeof(json_payload),
                                 "{\"nivel\":%.2f,\"bomba\":%d,\"min\":%.2f,\"max\":%.2f}",
@@ -255,6 +278,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
                            "%s",
                            json_len, json_payload);
     }
+    // Atualiza níveis mínimo e máximo via requisição HTTP
     else if (strstr(req, "GET /set_niveis"))
     {
         float min, max;
@@ -273,6 +297,7 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
                            "%s",
                            (int)strlen(txt), txt);
     }
+    // Envia página HTML padrão
     else
     {
         hs->len = snprintf(hs->response, sizeof(hs->response),
@@ -295,12 +320,14 @@ static err_t http_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t er
     return ERR_OK;
 }
 
+// Callback para novas conexões TCP
 static err_t connection_callback(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     tcp_recv(newpcb, http_recv);
     return ERR_OK;
 }
 
+// Inicia o servidor HTTP na porta 80
 static void start_http_server(void)
 {
     struct tcp_pcb *pcb = tcp_new();
@@ -319,48 +346,62 @@ static void start_http_server(void)
     printf("Servidor HTTP rodando na porta 80...\n");
 }
 
-#include "pico/bootrom.h"
-#define BOTAO_B 6
-void gpio_irq_handler(uint gpio, uint32_t events)
-{
-    reset_usb_boot(0, 0);
-}
-
 int main()
 {
+    // Configuração inicial dos botões
     gpio_init(BOTAO_B);
     gpio_set_dir(BOTAO_B, GPIO_IN);
     gpio_pull_up(BOTAO_B);
     gpio_set_irq_enabled_with_callback(BOTAO_B, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    gpio_set_irq_enabled(BOTAO_A, GPIO_IRQ_EDGE_FALL, true);
 
+    // Inicializa comunicação serial
     stdio_init_all();
     sleep_ms(2000);
 
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
+    // Configura LEDs como saídas
+    gpio_init(LED_AMARELO);
+    gpio_set_dir(LED_AMARELO, GPIO_OUT);
+    gpio_init(LED_VERDE);
+    gpio_set_dir(LED_VERDE, GPIO_OUT);
+    gpio_init(LED_VERMELHO);
+    gpio_set_dir(LED_VERMELHO, GPIO_OUT);
+    ligar_led_verde(); // Inicia com LED verde ligado
 
+    // Configura relé da bomba
+    gpio_init(RELAY_PIN);
+    gpio_set_dir(RELAY_PIN, GPIO_OUT);
+    gpio_put(RELAY_PIN, 0); // Bomba inicia desligada
+
+    // Configura botões como entradas com pull-up
     gpio_init(BOTAO_A);
     gpio_set_dir(BOTAO_A, GPIO_IN);
     gpio_pull_up(BOTAO_A);
-
     gpio_init(BOTAO_JOY);
     gpio_set_dir(BOTAO_JOY, GPIO_IN);
     gpio_pull_up(BOTAO_JOY);
 
-    // gpio_init(RELAY_PIN);
-    // gpio_set_dir(RELAY_PIN, GPIO_OUT);
-    // gpio_put(RELAY_PIN, 0);
+    // Configura PWM para o buzzer
+    gpio_set_function(BUZZER_A, GPIO_FUNC_PWM);
+    slice_buzzer = pwm_gpio_to_slice_num(BUZZER_A);
+    pwm_set_clkdiv(slice_buzzer, DIVIDER_PWM);
+    pwm_set_wrap(slice_buzzer, PERIOD);
+    pwm_set_gpio_level(BUZZER_A, 0);
+    pwm_set_enabled(slice_buzzer, true);
 
+    // Inicializa ADC para leitura do sensor
     adc_init();
     adc_gpio_init(POT_PIN);
     adc_select_input(2);
 
+    // Configura I2C para o display OLED
     i2c_init(I2C_PORT_DISP, 400 * 1000);
     gpio_set_function(I2C_SDA_DISP, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_DISP, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_DISP);
     gpio_pull_up(I2C_SCL_DISP);
 
+    // Inicializa display SSD1306
     ssd1306_t ssd;
     ssd1306_init(&ssd, WIDTH, HEIGHT, false, endereco, I2C_PORT_DISP);
     ssd1306_config(&ssd);
@@ -369,6 +410,7 @@ int main()
     ssd1306_draw_string(&ssd, "Aguarde...", 0, 30);
     ssd1306_send_data(&ssd);
 
+    // Inicializa Wi-Fi
     if (cyw43_arch_init())
     {
         ssd1306_fill(&ssd, false);
@@ -386,81 +428,83 @@ int main()
         return 1;
     }
 
+    // Exibe endereço IP no display
     uint8_t *ip = (uint8_t *)&(cyw43_state.netif[0].ip_addr.addr);
     char ip_str[24];
     snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-
     ssd1306_fill(&ssd, false);
     ssd1306_draw_string(&ssd, "WiFi => OK", 0, 0);
     ssd1306_draw_string(&ssd, ip_str, 0, 10);
     ssd1306_send_data(&ssd);
 
-    start_http_server();
-    // char str_x[5]; // Buffer para armazenar a string
-    // char str_y[5]; // Buffer para armazenar a string
-    // bool cor = true;
+    start_http_server(); // Inicia servidor HTTP
 
+    // Buffer para exibição no display
     char buffer[20];
     while (true)
     {
-        cyw43_arch_poll();
+        cyw43_arch_poll(); // Atualiza estado da rede Wi-Fi
 
+        // Lê nível de água
         uint16_t adc_raw = read_adc_avg();
         float voltage = read_voltage(adc_raw);
         float level = calculate_level(voltage);
+        nivel_atual = level;
 
+        this_current_time = time_us_64();
+
+        // Verifica alarme de nível alto
+        if (nivel_atual > (nivel_maximo + HISTERESE + 3))
+        {
+            ligar_led_vermelho(); // Liga LED vermelho para alarme
+            if (!buzzer_state) {
+                buzzer_on(); // Ativa buzzer se não estiver ligado
+            }
+        }
+        // Verifica condição de nível baixo (bomba ligada)
+        else if (nivel_atual <= (nivel_minimo - HISTERESE))
+        {
+            gpio_put(RELAY_PIN, 1); // Liga bomba
+            estado_bomba = true;
+            ligar_led_amarelo();    // Liga LED amarelo
+            buzzer_off();           // Desliga buzzer
+            printf("Bomba LIGADA - Nível: %.2f (abaixo de %.2f)\n", nivel_atual, nivel_minimo);
+        }
+        // Verifica condição de nível alto (bomba desligada)
+        else if (nivel_atual >= (nivel_maximo + HISTERESE))
+        {
+            gpio_put(RELAY_PIN, 0); // Desliga bomba
+            estado_bomba = false;
+            ligar_led_verde();      // Liga LED verde
+            buzzer_off();           // Desliga buzzer
+            printf("Bomba DESLIGADA - Nível: %.2f (acima de %.2f)\n", nivel_atual, nivel_maximo);
+        }
+        else // Nível dentro da faixa normal
+        {
+            if (!estado_bomba) {
+                ligar_led_verde(); // Mantém LED verde se bomba está desligada
+            }
+            buzzer_off(); // Garante que buzzer está desligado
+        }
+
+        // Atualiza informações no display
         ssd1306_fill(&ssd, false);
-
         snprintf(buffer, sizeof(buffer), "ADC: %d", adc_raw);
         ssd1306_draw_string(&ssd, buffer, 10, 5);
-
-        snprintf(buffer, sizeof(buffer), "V: %.2f", voltage);
+        snprintf(buffer, sizeof(buffer), "BOMBA: %s", estado_bomba ? "LIGADA" : "DESL.");
         ssd1306_draw_string(&ssd, buffer, 10, 15);
-
         snprintf(buffer, sizeof(buffer), "%%: %.2f", level);
         ssd1306_draw_string(&ssd, buffer, 10, 25);
-
         snprintf(buffer, sizeof(buffer), "MAX: %.2f", nivel_maximo);
         ssd1306_draw_string(&ssd, buffer, 10, 35);
-
         snprintf(buffer, sizeof(buffer), "MIN: %.2f", nivel_minimo);
         ssd1306_draw_string(&ssd, buffer, 10, 45);
-
         ssd1306_draw_string(&ssd, ip_str, 10, 55);
-
         ssd1306_send_data(&ssd);
 
-        sleep_ms(100);
-
-        // // Leitura dos valores analógicos
-        // adc_select_input(0);
-        // uint16_t adc_value_x = adc_read();
-        // adc_select_input(1);
-        // uint16_t adc_value_y = adc_read();
-
-        // sprintf(str_x, "%d", adc_value_x);            // Converte o inteiro em string
-        // sprintf(str_y, "%d", adc_value_y);            // Converte o inteiro em string
-        // ssd1306_fill(&ssd, !cor);                     // Limpa o display
-        // ssd1306_rect(&ssd, 3, 3, 122, 60, cor, !cor); // Desenha um retângulo
-        // ssd1306_line(&ssd, 3, 25, 123, 25, cor);      // Desenha uma linha
-        // ssd1306_line(&ssd, 3, 37, 123, 37, cor);      // Desenha uma linha
-
-        // ssd1306_draw_string(&ssd, "CEPEDI   TIC37", 8, 6); // Desenha uma string
-        // ssd1306_draw_string(&ssd, "EMBARCATECH", 20, 16);  // Desenha uma string
-        // ssd1306_draw_string(&ssd, ip_str, 10, 28);
-        // ssd1306_draw_string(&ssd, "X    Y    PB", 20, 41);           // Desenha uma string
-        // ssd1306_line(&ssd, 44, 37, 44, 60, cor);                     // Desenha uma linha vertical
-        // ssd1306_draw_string(&ssd, str_x, 8, 52);                     // Desenha uma string
-        // ssd1306_line(&ssd, 84, 37, 84, 60, cor);                     // Desenha uma linha vertical
-        // ssd1306_draw_string(&ssd, str_y, 49, 52);                    // Desenha uma string
-        // ssd1306_rect(&ssd, 52, 90, 8, 8, cor, !gpio_get(BOTAO_JOY)); // Desenha um retângulo
-        // ssd1306_rect(&ssd, 52, 102, 8, 8, cor, !gpio_get(BOTAO_A));  // Desenha um retângulo
-        // ssd1306_rect(&ssd, 52, 114, 8, 8, cor, !cor);                // Desenha um retângulo
-        // ssd1306_send_data(&ssd);                                     // Atualiza o display
-
-        // sleep_ms(300);
+        sleep_ms(100); // Aguarda 100ms antes da próxima iteração
     }
 
-    cyw43_arch_deinit();
-    return 0;
-}
+    cyw43_arch_deinit(); // Finaliza Wi-Fi
+t();
+ 
