@@ -506,5 +506,5 @@ int main()
     }
 
     cyw43_arch_deinit(); // Finaliza Wi-Fi
-t();
+}
  
