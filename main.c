@@ -43,8 +43,8 @@ uint slice_buzzer;                             // Slice PWM associado ao buzzer
 #define HISTERESE 2.0f // Margem de 2% para evitar oscilações na lógica de controle
 
 // Configurações de Wi-Fi
-#define WIFI_SSID "Jonas Souza"
-#define WIFI_PASS "12345678"
+#define WIFI_SSID "Seu_usuario_wifi"
+#define WIFI_PASS "Sua_senha_wifi"
 
 // Configurações do display OLED I2C
 #define I2C_PORT_DISP i2c1
